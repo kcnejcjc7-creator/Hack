@@ -1,0 +1,301 @@
+name: Koharu Build V3 Final
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: koharu-build-v3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build:
+    name: Build Minecraft mod (JDK 21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle and cache dependencies
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Locate project (extract ZIP if needed)
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          find_wrapper() {
+            find "$1" -maxdepth 4 -type f -name gradlew \
+              -not -path '*/.git/*' -not -path '*/__MACOSX/*' -not -path '*/.ci-*' 2>/dev/null | head -n 1
+          }
+
+          wrapper="$(find_wrapper .)"
+
+          if [[ -z "$wrapper" ]]; then
+            mapfile -t zips < <(find . -maxdepth 2 -type f -iname '*.zip' -not -path './.git/*' | sort)
+            if [[ ${#zips[@]} -eq 0 ]]; then
+              echo "::error::No gradlew and no .zip found in the repository. Upload the ZIP or the extracted project."
+              exit 1
+            fi
+            zip="${zips[0]}"
+            for z in "${zips[@]}"; do
+              if [[ "${z,,}" == *koharu* || "${z,,}" == *anubis* ]]; then zip="$z"; break; fi
+            done
+            echo "Using ZIP: $zip"
+            python3 - "$zip" <<'PY'
+          import sys, zipfile, os
+          zpath = sys.argv[1]
+          dest = os.path.realpath(".ci-src")
+          os.makedirs(dest, exist_ok=True)
+          with zipfile.ZipFile(zpath) as z:
+              bad = z.testzip()
+              if bad:
+                  sys.exit(f"::error::Corrupt ZIP member: {bad}")
+              for m in z.infolist():
+                  target = os.path.realpath(os.path.join(dest, m.filename))
+                  if not (target == dest or target.startswith(dest + os.sep)):
+                      sys.exit(f"::error::Unsafe path in ZIP: {m.filename}")
+                  if "__MACOSX" in m.filename or m.filename.endswith(".DS_Store"):
+                      continue
+                  z.extract(m, dest)
+          print("Extracted OK")
+          PY
+            wrapper="$(find_wrapper .ci-src)"
+            if [[ -z "$wrapper" ]]; then
+              echo "::error::ZIP extracted but no gradlew inside. Layout was:"
+              find .ci-src -maxdepth 3 | head -50
+              exit 1
+            fi
+          fi
+
+          project_dir="$(dirname "$wrapper")"
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Selected project directory: $project_dir"
+          ls -la "$project_dir"
+
+      - name: Apply source fix (BorderlessFullscreen cast)
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=anubis/src/main/java/net/anubis/client/gui/BorderlessFullscreen.java
+          sed -i 's/(BorderlessFullscreen\.Switchable)window;/(BorderlessFullscreen.Switchable)(Object)window;/' "$f"
+          grep -n 'Switchable)(Object)window' "$f" || { echo "::error::fix not applied"; exit 1; }
+
+      - name: Prepare Gradle wrapper
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
+          test -f gradle/wrapper/gradle-wrapper.properties || { echo "::error::gradle/wrapper/gradle-wrapper.properties missing"; exit 1; }
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "::error::gradle/wrapper/gradle-wrapper.jar missing"; exit 1; }
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verify source import (non-blocking)
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [[ -f tools/verify_anubis_full_import.py ]]; then
+            python3 tools/verify_anubis_full_import.py
+          else
+            echo "verify script not present, skipped"
+          fi
+
+      - name: Build the mod JAR
+        id: build
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build
+          attempt=1
+          until ./gradlew build -x test --no-daemon --stacktrace --console=plain 2>&1 | tee "build/gradle-build-$attempt.log"; do
+            if grep -q -E 'error:|^e: |Compilation failed|compileJava.*FAILED' "build/gradle-build-$attempt.log"; then
+              echo "Real compile error - not retrying."
+              cp "build/gradle-build-$attempt.log" build/gradle-build.log
+              exit 1
+            fi
+            if [[ $attempt -ge 2 ]]; then
+              cp "build/gradle-build-$attempt.log" build/gradle-build.log
+              exit 1
+            fi
+            echo "Build failed without a compile error (likely network). Retrying..."
+            attempt=$((attempt+1))
+            sleep 10
+          done
+          cp "build/gradle-build-$attempt.log" build/gradle-build.log
+
+      - name: Show compile errors in summary
+        if: failure()
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          {
+            echo '## Compile errors'
+            echo
+            echo 'Copy this block and send it for fixing:'
+            echo '```'
+            grep -h -E -B1 -A3 'error:|^e: |What went wrong|FAILED' build/gradle-build.log 2>/dev/null | head -200 || echo "no log captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run unit tests (non-blocking)
+        continue-on-error: true
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: ./gradlew test --no-daemon --stacktrace --console=plain
+
+      - name: Collect final mod JAR and checksum
+        id: collect
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/.ci-artifacts"
+          mkdir -p "$out"
+          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-dev.jar' ! -name '*-sources-dev.jar' | sort)
+          if [[ ${#jars[@]} -eq 0 ]]; then
+            echo "::error::Build finished but no distributable JAR in build/libs"
+            ls -la build/libs || true
+            exit 1
+          fi
+          cp "${jars[@]}" "$out/"
+          for j in "$out"/*.jar; do
+            unzip -tq "$j" >/dev/null || { echo "::error::Corrupt JAR: $j"; exit 1; }
+          done
+          (cd "$out" && sha256sum *.jar > SHA256SUMS.txt)
+          ls -lh "$out"
+
+      - name: Inspect JAR contents
+        if: success()
+        shell: bash
+        run: |
+          python3 - "$GITHUB_WORKSPACE/.ci-artifacts" <<'PY'
+          import sys, os, re, json, zipfile, glob, io, hashlib
+
+          art = sys.argv[1]
+          lines = ["# JAR inspection report", ""]
+          RISKY = {
+              b"java/lang/Runtime": "Runtime (possible exec)",
+              b"java/lang/ProcessBuilder": "ProcessBuilder (runs programs)",
+              b"java/net/URLClassLoader": "URLClassLoader (dynamic loading)",
+              b"defineClass": "defineClass (dynamic class definition)",
+              b"java/lang/reflect/Proxy": "Proxy",
+              b"sun/misc/Unsafe": "Unsafe",
+              b"java/net/Socket": "raw Socket",
+              b"HttpURLConnection": "HttpURLConnection (network)",
+              b"java/net/http/HttpClient": "HttpClient (network)",
+              b"Files.delete": "file deletion",
+          }
+          URL_RE = re.compile(rb"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{4,200}")
+
+          def inspect(jar_bytes, label, depth=0):
+              z = zipfile.ZipFile(io.BytesIO(jar_bytes))
+              names = z.namelist()
+              classes = [n for n in names if n.endswith(".class")]
+              nested = [n for n in names if n.endswith(".jar")]
+              lines.append(f"{'#'*(2+depth)} {label}")
+              lines.append(f"- sha256: `{hashlib.sha256(jar_bytes).hexdigest()}`")
+              lines.append(f"- entries: {len(names)}, classes: {len(classes)}, nested jars: {len(nested)}")
+              if "fabric.mod.json" in names:
+                  try:
+                      m = json.loads(z.read("fabric.mod.json"))
+                      lines.append(f"- mod id/version: `{m.get('id')}` / `{m.get('version')}`")
+                      lines.append(f"- entrypoints: `{json.dumps(m.get('entrypoints', {}))}`")
+                      lines.append(f"- depends: `{json.dumps(m.get('depends', {}))}`")
+                      for mx in m.get("mixins", []):
+                          mx = mx if isinstance(mx, str) else mx.get("config")
+                          if mx and mx in names:
+                              cfg = json.loads(z.read(mx))
+                              pkg = cfg.get("package", "").replace(".", "/")
+                              missing = []
+                              for k in ("mixins", "client", "server"):
+                                  for c in cfg.get(k, []):
+                                      p = f"{pkg}/{c.replace('.', '/')}.class"
+                                      if p not in names:
+                                          missing.append(p)
+                              lines.append(f"- mixin config `{mx}`: " + ("all classes present" if not missing else f"**MISSING {len(missing)}**: {missing[:10]}"))
+                          elif mx:
+                              lines.append(f"- mixin config `{mx}` **not found in jar**")
+                      for jj in m.get("jars", []):
+                          f = jj.get("file")
+                          lines.append(f"- declared nested jar `{f}`: " + ("present" if f in names else "**MISSING**"))
+                  except Exception as e:
+                      lines.append(f"- fabric.mod.json unreadable: {e}")
+              else:
+                  lines.append("- no fabric.mod.json (library jar)")
+
+              urls, risky = {}, {}
+              for n in classes:
+                  data = z.read(n)
+                  for u in URL_RE.findall(data):
+                      urls.setdefault(u.decode("latin1"), set()).add(n)
+                  for k, desc in RISKY.items():
+                      if k in data:
+                          risky.setdefault(desc, set()).add(n)
+              if urls:
+                  lines.append(f"- hard-coded URLs ({len(urls)}):")
+                  for u in sorted(urls)[:40]:
+                      lines.append(f"  - `{u}`")
+              if risky:
+                  lines.append("- risky API references (classes using each):")
+                  for d, cs in sorted(risky.items()):
+                      lines.append(f"  - {d}: {len(cs)} class(es), e.g. `{sorted(cs)[0]}`")
+              lines.append("")
+              if depth < 2:
+                  for n in nested:
+                      inspect(z.read(n), f"nested: {n}", depth + 1)
+
+          for jar in sorted(glob.glob(os.path.join(art, "*.jar"))):
+              with open(jar, "rb") as f:
+                  inspect(f.read(), os.path.basename(jar))
+
+          report = "\n".join(lines)
+          open(os.path.join(art, "JAR-INSPECTION.md"), "w").write(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(report[:900000])
+          print(report[:6000])
+          PY
+
+      - name: Upload mod JAR artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Koharu-V3-Mod-JAR
+          path: .ci-artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Koharu-V3-Diagnostics
+          path: |
+            ${{ steps.source.outputs.project_dir }}/build/gradle-build*.log
+            ${{ steps.source.outputs.project_dir }}/build/reports/
+            ${{ steps.source.outputs.project_dir }}/build/test-results/
+            ${{ steps.source.outputs.project_dir }}/anubis/build/reports/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
